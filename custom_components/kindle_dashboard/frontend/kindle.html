@@ -451,7 +451,8 @@ function kbPushBattery(pct) {
   var loc = (typeof LOCATION !== "undefined" ? LOCATION : "kindle")
     .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   /* Device name from URL ?device= param — makes entity ID unique per device */
-  var deviceName = (new URLSearchParams(window.location.search).get("device") || "")
+  var _dn = (window.location.search.split("device=")[1] || "").split("&")[0] || "";
+  var deviceName = decodeURIComponent(_dn.replace(/\+/g, " "))
     .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   var entityId = deviceName
     ? "sensor." + loc + "_battery_" + deviceName
@@ -613,37 +614,60 @@ function apiHeaders() {
   };
 }
 
+/* ── STATE ───────────────────<script>
 /* ── STATE ────────────────────────────────────────── */
-let entityStates = {};
+var entityStates = {};
 
-/* ── API HELPERS ──────────────────────────────────── */
-async function callService(domain, service, entityId) {
-  try {
-    const r = await fetch(`${HA_URL}/api/services/${domain}/${service}`, {
-      method: "POST", headers: apiHeaders(),
-      body: JSON.stringify({ entity_id: entityId }),
-    });
-    if (r.ok) { toast("Done"); setTimeout(fetchAll, 1200); }
-    else toast("Error " + r.status);
-  } catch(e) { toast("Network error"); }
+/* ── API HELPERS (ES5 / XHR) ──────────────────────── */
+function applyHeaders(x) {
+  x.setRequestHeader("Content-Type", "application/json");
+  x.setRequestHeader("Authorization", "Bearer " + HA_TOKEN);
 }
 
-async function fetchState(id) {
-  try {
-    const r = await fetch(`${HA_URL}/api/states/${id}`, { headers: apiHeaders() });
-    return r.ok ? await r.json() : null;
-  } catch(e) { return null; }
+function callService(domain, service, entityId) {
+  var x = new XMLHttpRequest();
+  x.open("POST", HA_URL + "/api/services/" + domain + "/" + service, true);
+  applyHeaders(x);
+  x.timeout = 5000;
+  x.onload = function() {
+    if (x.status >= 200 && x.status < 300) {
+      toast("Done");
+      setTimeout(fetchAll, 1200);
+    } else {
+      toast("Error " + x.status);
+    }
+  };
+  x.onerror = function() { toast("Network error"); };
+  x.send(JSON.stringify({ entity_id: entityId }));
+}
+
+function fetchState(id, cb) {
+  var x = new XMLHttpRequest();
+  x.open("GET", HA_URL + "/api/states/" + id, true);
+  applyHeaders(x);
+  x.timeout = 5000;
+  x.onload = function() {
+    if (x.status === 200) {
+      try { cb(JSON.parse(x.responseText), id); }
+      catch (e) { cb(null, id); }
+    } else cb(null, id);
+  };
+  x.onerror = function() { cb(null, id); };
+  x.ontimeout = function() { cb(null, id); };
+  x.send();
 }
 
 /* ── COLLECT ALL ENTITY IDS ACROSS SECTIONS ───────── */
 function allEntityIds() {
-  const ids = new Set();
-  (SECTIONS || []).forEach(sec => {
-    (sec.items || []).forEach(item => {
-      if (item.id) ids.add(item.id);
-    });
-  });
-  return [...ids];
+  var ids = [];
+  var secs = (typeof SECTIONS !== "undefined") ? SECTIONS : [];
+  for (var s = 0; s < secs.length; s++) {
+    var items = secs[s].items || [];
+    for (var k = 0; k < items.length; k++) {
+      if (items[k].id && ids.indexOf(items[k].id) < 0) ids.push(items[k].id);
+    }
+  }
+  return ids;
 }
 
 function doRefresh() {
@@ -654,226 +678,253 @@ function doRefresh() {
   }
 }
 
-async function fetchAll() {
-  /* conn-status updated after fetch completes */
-  const ids = allEntityIds();
-  const results = await Promise.all(ids.map(fetchState));
-  let anyFail = false;
-  results.forEach((d, i) => {
-    if (d) entityStates[ids[i]] = d;
-    else anyFail = true;
-  });
-  document.getElementById("conn-status").textContent = anyFail ? "◌ partial" : "● live";
-  updateAllSections();
-  updateLightSummary();
-  document.getElementById("last-update").textContent =
-    "Updated: " + formatTime(new Date());
+/* Sequential fetch: old WebKit dislikes many parallel XHRs */
+function fetchAll() {
+  var ids = allEntityIds();
+  var i = 0, anyFail = false;
+  function next() {
+    if (i >= ids.length) { finish(); return; }
+    fetchState(ids[i], function(d, id) {
+      if (d) entityStates[id] = d; else anyFail = true;
+      i++;
+      next();
+    });
+  }
+  function finish() {
+    document.getElementById("conn-status").textContent = anyFail ? "partial" : "live";
+    updateAllSections();
+    updateLightSummary();
+    document.getElementById("last-update").textContent =
+      "Updated: " + formatTime(new Date());
+  }
+  next();
+}
+
+/* ── CLASS HELPER (old WebKit: no toggle(name, force)) */
+function setOn(el, on) {
+  if (!el) return;
+  if (on) { if (el.className.indexOf(" on") < 0) el.className += " on"; }
+  else { el.className = el.className.replace(/(\s|^)on(\s|$)/g, " "); }
 }
 
 /* ── LIGHT STATUS STRIP ───────────────────────────── */
-function buildLightSummary() {
-  const lights = [];
-  (SECTIONS || []).forEach(sec => {
-    if (sec.type === "toggles") {
-      (sec.items || []).filter(i => i.id.startsWith("light.") && !i.hide_from_status)
-        .forEach(i => lights.push(i));
+function lightItems() {
+  var lights = [];
+  var secs = (typeof SECTIONS !== "undefined") ? SECTIONS : [];
+  for (var s = 0; s < secs.length; s++) {
+    if (secs[s].type === "toggles") {
+      var items = secs[s].items || [];
+      for (var k = 0; k < items.length; k++) {
+        if (items[k].id.indexOf("light.") === 0 && !items[k].hide_from_status) {
+          lights.push(items[k]);
+        }
+      }
     }
-  });
-  const strip = document.getElementById("lights-right");
+  }
+  return lights;
+}
+
+function buildLightSummary() {
+  var lights = lightItems();
+  var strip = document.getElementById("lights-right");
   if (!lights.length) { strip.style.display = "none"; return; }
-  strip.style.display = "flex";
-  const container = document.getElementById("light-dots");
-  container.innerHTML = lights.map(l =>
-    `<span class="light-dot" id="dot-${l.id.replace(/\./g,'_')}" title="${l.label || l.id}"></span>`
-  ).join("");
+  strip.style.display = "block";
+  var html = "";
+  for (var k = 0; k < lights.length; k++) {
+    var l = lights[k];
+    html += '<span class="light-dot" id="dot-' + l.id.replace(/\./g, "_") +
+            '" title="' + (l.label || l.id) + '"></span>';
+  }
+  document.getElementById("light-dots").innerHTML = html;
 }
 
 function updateLightSummary() {
-  const lights = [];
-  (SECTIONS || []).forEach(sec => {
-    if (sec.type === "toggles") {
-      (sec.items || []).filter(i => i.id.startsWith("light.") && !i.hide_from_status)
-        .forEach(i => lights.push(i));
-    }
-  });
-  let onCount = 0, onNames = [];
-  lights.forEach(l => {
-    const d = entityStates[l.id];
-    const on = !!(d && d.state === "on");
+  var lights = lightItems();
+  var onCount = 0, onNames = [];
+  for (var k = 0; k < lights.length; k++) {
+    var l = lights[k];
+    var d = entityStates[l.id];
+    var on = !!(d && d.state === "on");
     if (on) { onCount++; onNames.push(l.label || l.id); }
-    const dot = document.getElementById("dot-" + l.id.replace(/\./g, "_"));
+    var dot = document.getElementById("dot-" + l.id.replace(/\./g, "_"));
     if (dot) dot.className = "light-dot" + (on ? " on" : "");
-  });
+  }
   document.getElementById("lights-on-count").textContent =
-    onCount === 0 ? "All lights off" : onCount + " light" + (onCount !== 1 ? "s" : "") + " on";
+    onCount === 0 ? "All lights off" : onCount + " on";
   document.getElementById("lights-on-names").textContent = onNames.join(", ");
 }
 
 /* ── BUILD SECTIONS ───────────────────────────────── */
 function buildAllSections() {
-  const root = document.getElementById("sections-root");
+  var root = document.getElementById("sections-root");
   root.innerHTML = "";
-  (SECTIONS || []).forEach((sec, si) => {
-    const wrap = document.createElement("div");
+  var secs = (typeof SECTIONS !== "undefined") ? SECTIONS : [];
+  for (var si = 0; si < secs.length; si++) {
+    var sec = secs[si];
+    var wrap = document.createElement("div");
     wrap.className = "section-wrap";
     wrap.id = "sec-" + si;
-
-    const lbl = document.createElement("div");
+    var lbl = document.createElement("div");
     lbl.className = "section-label";
     lbl.textContent = sec.label || "";
     wrap.appendChild(lbl);
-
-    if      (sec.type === "sensors") buildSensorSection(wrap, sec, si);
-    else if (sec.type === "scenes")  buildScenesSection(wrap, sec, si);
+    if (sec.type === "sensors") buildSensorSection(wrap, sec, si);
+    else if (sec.type === "scenes") buildScenesSection(wrap, sec, si);
     else if (sec.type === "toggles") buildTogglesSection(wrap, sec, si);
-
     root.appendChild(wrap);
-  });
+  }
 }
 
 function buildSensorSection(wrap, sec, si) {
-  const grid = document.createElement("div");
+  var grid = document.createElement("div");
   grid.className = "sensor-grid";
   grid.id = "sensor-grid-" + si;
-  const cols = Math.min((sec.items || []).length, 4);
-  grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-  const inline = (typeof INLINE_UNITS !== "undefined") ? INLINE_UNITS : false;
-
-  (sec.items || []).forEach((item, ii) => {
-    const tile = document.createElement("div");
+  var items = sec.items || [];
+  var cols = Math.min(items.length, 4);
+  /* grid CSS unsupported on old WebKit: use table-cell fallback */
+  for (var c = 0; c < cols; c++) { grid.innerHTML += ""; }
+  var inline = (typeof INLINE_UNITS !== "undefined") ? INLINE_UNITS : false;
+  for (var ii = 0; ii < items.length; ii++) {
+    var item = items[ii];
+    var tile = document.createElement("div");
     tile.className = "sensor-tile";
-    tile.id = `sensor-${si}-${ii}`;
-
+    tile.id = "sensor-" + si + "-" + ii;
+    var labelText = item.label || (sec.hide_entity_ids ? "" : item.id);
     if (inline) {
-      tile.innerHTML = `
-        <div class="s-label">${item.label || (sec.hide_entity_ids ? '' : item.id)}</div>
-        <div><span class="s-value-inline" id="sv-${si}-${ii}">--</span><span class="s-unit-inline">${item.unit || ""}</span></div>`;
+      tile.innerHTML =
+        '<div class="s-label">' + labelText + '</div>' +
+        '<div><span class="s-value-inline" id="sv-' + si + '-' + ii + '">--</span>' +
+        '<span class="s-unit-inline">' + (item.unit || "") + '</span></div>';
     } else {
-      tile.innerHTML = `
-        <div class="s-label">${item.label || (sec.hide_entity_ids ? '' : item.id)}</div>
-        <div class="s-value" id="sv-${si}-${ii}">--</div>
-        <div class="s-unit">${item.unit || ""}</div>`;
+      tile.innerHTML =
+        '<div class="s-label">' + labelText + '</div>' +
+        '<div class="s-value" id="sv-' + si + '-' + ii + '">--</div>' +
+        '<div class="s-unit">' + (item.unit || "") + '</div>';
     }
     grid.appendChild(tile);
-  });
+  }
   wrap.appendChild(grid);
 }
 
 function buildScenesSection(wrap, sec, si) {
-  const grid = document.createElement("div");
+  var grid = document.createElement("div");
   grid.className = "scenes-grid";
-  // Use two_columns setting if set, otherwise auto-detect
-  const cols = sec.two_columns ? 2 : ((sec.items || []).length >= 2 ? 2 : 1);
-  grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-
-  (sec.items || []).forEach((item, ii) => {
-    const btn = document.createElement("button");
+  var items = sec.items || [];
+  var cols = sec.two_columns ? 2 : (items.length >= 2 ? 2 : 1);
+  for (var ii = 0; ii < items.length; ii++) {
+    var item = items[ii];
+    var btn = document.createElement("button");
     btn.className = "scene-btn";
-    btn.id = `scene-${si}-${ii}`;
-    btn.innerHTML = `
-      <div class="scene-icon-bg"><span class="mdi">${mdiChar(item.icon || "flash")}</span></div>
-      <div class="scene-body">
-        <span class="scene-name">${item.name || item.id}</span>
-        <span class="scene-desc">${item.desc || ""}</span>
-      </div>`;
-    btn.addEventListener("click", async () => {
-      wrap.querySelectorAll(".scene-btn").forEach(b => b.classList.remove("active-scene"));
-      btn.classList.add("active-scene");
-      await callService("scene", "turn_on", item.entity || item.id);
-    });
+    btn.id = "scene-" + si + "-" + ii;
+    btn.innerHTML =
+      '<div class="scene-icon-bg"><span class="mdi">' +
+      mdiChar(item.icon || "flash") + '</span></div>' +
+      '<div class="scene-body"><span class="scene-name">' + (item.name || item.id) +
+      '</span><span class="scene-desc">' + (item.desc || "") + '</span></div>';
+    btn.onclick = (function(w, b, it) {
+      return function() {
+        var all = w.querySelectorAll(".scene-btn");
+        for (var q = 0; q < all.length; q++) {
+          all[q].className = all[q].className.replace(/(\s|^)active-scene(\s|$)/g, " ");
+        }
+        b.className += " active-scene";
+        callService("scene", "turn_on", it.entity || it.id);
+      };
+    })(wrap, btn, item);
     grid.appendChild(btn);
-  });
+  }
   wrap.appendChild(grid);
 }
 
 function buildTogglesSection(wrap, sec, si) {
-  const list = document.createElement("div");
+  var list = document.createElement("div");
   list.className = sec.two_columns ? "toggles-grid" : "toggles-list";
-
-  (sec.items || []).forEach((item, ii) => {
-    const row = document.createElement("div");
+  var items = sec.items || [];
+  for (var ii = 0; ii < items.length; ii++) {
+    var item = items[ii];
+    var row = document.createElement("div");
     row.className = "toggle-row";
-    row.id = `toggle-${si}-${ii}`;
-    row.innerHTML = `
-      <div class="toggle-icon"><span class="mdi">${mdiChar(item.icon || "lightbulb")}</span></div>
-      <div class="toggle-label">
-        ${item.label || item.id}
-        ${sec.hide_entity_ids ? "" : `<small>${item.id}</small>`}
-      </div>
-      <div class="toggle-switch"></div>`;
-    row.addEventListener("click", async () => {
-      const on = row.classList.contains("on");
-      row.classList.toggle("on", !on);
-      const domain = (item.id || "").split(".")[0] || "light";
-      await callService(domain, on ? "turn_off" : "turn_on", item.id);
-    });
+    row.id = "toggle-" + si + "-" + ii;
+    var idText = item.label || item.id;
+    if (!sec.hide_entity_ids) idText += "<small>" + item.id + "</small>";
+    row.innerHTML =
+      '<div class="toggle-icon"><span class="mdi">' +
+      mdiChar(item.icon || "lightbulb") + '</span></div>' +
+      '<div class="toggle-label">' + idText + '</div>' +
+      '<div class="toggle-switch"></div>';
+    row.onclick = (function(r, it) {
+      return function() {
+        var on = r.className.indexOf("on") >= 0;
+        setOn(r, !on);
+        var domain = (it.id || "").split(".")[0] || "light";
+        callService(domain, on ? "turn_off" : "turn_on", it.id);
+      };
+    })(row, item);
     list.appendChild(row);
-  });
+  }
   wrap.appendChild(list);
 }
 
 /* ── UPDATE ALL SECTIONS ──────────────────────────── */
 function updateAllSections() {
-  (SECTIONS || []).forEach((sec, si) => {
+  var secs = (typeof SECTIONS !== "undefined") ? SECTIONS : [];
+  for (var si = 0; si < secs.length; si++) {
+    var sec = secs[si];
+    var items = sec.items || [];
     if (sec.type === "sensors") {
-      (sec.items || []).forEach((item, ii) => {
-        const el = document.getElementById(`sv-${si}-${ii}`);
-        if (!el) return;
-        const d = entityStates[item.id];
-        el.textContent = d
-          ? (isNaN(parseFloat(d.state)) ? d.state : Math.round(parseFloat(d.state) * 10) / 10)
-          : "--";
-      });
+      for (var ii = 0; ii < items.length; ii++) {
+        var el = document.getElementById("sv-" + si + "-" + ii);
+        if (!el) continue;
+        var d = entityStates[items[ii].id];
+        var v = (d ? parseFloat(d.state) : NaN);
+        el.textContent = d ? (isNaN(v) ? d.state : (Math.round(v * 10) / 10)) : "--";
+      }
     } else if (sec.type === "toggles") {
-      (sec.items || []).forEach((item, ii) => {
-        const row = document.getElementById(`toggle-${si}-${ii}`);
-        if (!row) return;
-        const d = entityStates[item.id];
-        row.classList.toggle("on", !!(d && d.state === "on"));
-      });
+      for (var j = 0; j < items.length; j++) {
+        var row = document.getElementById("toggle-" + si + "-" + j);
+        if (!row) continue;
+        var dd = entityStates[items[j].id];
+        setOn(row, !!(dd && dd.state === "on"));
+      }
     }
-  });
+  }
 }
 
-/* ── CLOCK ────────────────────────────────────────── */
-/* ── TIMEZONE-AWARE TIME FORMATTING ──────────────────────
-   The Kindle browser runs in UTC regardless of device timezone.
-   We fetch the timezone from HA /api/config on boot and use
-   Intl.DateTimeFormat (or a manual offset fallback) to show
-   the correct local time.
-──────────────────────────────────────────────────────── */
-let _tz = null;  // set after fetchTimezone() resolves
+/* ── TIME (manual, no Intl on old WebKit) ─────────── */
+var _utcOffsetSec = null;
 
-async function fetchTimezone() {
-  try {
-    const r = await fetch(HA_URL + "/api/config", { headers: apiHeaders() });
-    if (r.ok) {
-      const d = await r.json();
-      _tz = d.time_zone || null;  // e.g. "America/Los_Angeles"
+function fetchTimezone(cb) {
+  var x = new XMLHttpRequest();
+  x.open("GET", HA_URL + "/api/config", true);
+  applyHeaders(x);
+  x.timeout = 4000;
+  x.onload = function() {
+    if (x.status === 200) {
+      try {
+        var d = JSON.parse(x.responseText);
+        if (typeof d.utc_offset !== "undefined") _utcOffsetSec = d.utc_offset;
+      } catch (e) {}
     }
-  } catch(e) {}
+    if (cb) cb();
+  };
+  x.onerror = function() { if (cb) cb(); };
+  x.ontimeout = function() { if (cb) cb(); };
+  x.send();
 }
 
 function formatTime(date) {
-  // Try Intl with the HA timezone first
-  if (_tz && typeof Intl !== "undefined" && Intl.DateTimeFormat) {
-    try {
-      return new Intl.DateTimeFormat([], {
-        hour: "2-digit", minute: "2-digit", timeZone: _tz
-      }).format(date);
-    } catch(e) {}
+  if (_utcOffsetSec !== null) {
+    var t = new Date(date.getTime() + _utcOffsetSec * 1000);
+    return pad(t.getUTCHours()) + ":" + pad(t.getUTCMinutes());
   }
-  // Fallback: plain locale string (UTC on Kindle, correct on other browsers)
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return pad(date.getHours()) + ":" + pad(date.getMinutes());
 }
 
-/* clock is shown in kb-bar only */
-
 function toast(msg) {
-  const el = document.getElementById("toast");
+  var el = document.getElementById("toast");
   el.textContent = msg; el.style.display = "block";
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.style.display = "none"; }, 1800);
+  toast._t = setTimeout(function() { el.style.display = "none"; }, 1800);
 }
 
 /* ── BOOT ─────────────────────────────────────────── */
@@ -882,32 +933,13 @@ document.getElementById("loc-name").textContent =
 
 buildLightSummary();
 buildAllSections();
-// Fetch timezone from HA, then start clock (ensures first tick is correct)
-fetchTimezone().then(() => {
-  if (_barVisible) kbTick();  // now formatTime is available
-  kbCheckReload();  // record initial reload token
+fetchTimezone(function() {
+  if (_barVisible) kbTick();
+  kbCheckReload();
 });
 fetchAll();
 setInterval(fetchAll,
-  (typeof REFRESH_INTERVAL !== 'undefined' ? REFRESH_INTERVAL : 60) * 1000);
-</script>
-<script>
-/* Set device label in footer — runs after full DOM parse */
-(function() {
-  /* Manual query string parser for old WebKit compatibility */
-  var search = window.location.search.slice(1);
-  var dn = "";
-  search.split("&").forEach(function(pair) {
-    var parts = pair.split("=");
-    if (parts[0] === "device" && parts[1]) {
-      dn = decodeURIComponent(parts[1].replace(/\+/g, " "));
-    }
-  });
-  if (dn) {
-    var el = document.getElementById("device-label");
-    if (el) el.textContent = dn;
-  }
-})();
+  (typeof REFRESH_INTERVAL !== "undefined" ? REFRESH_INTERVAL : 60) * 1000);
 </script>
 </body>
 </html>
